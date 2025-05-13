@@ -1,5 +1,11 @@
 # Terminal CLI Utilities
 
+![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
+![Python](https://img.shields.io/badge/Python-3.6%2B-green)
+![ncurses](https://img.shields.io/badge/ncurses-6.0%2B-lightblue)
+![Platform](https://img.shields.io/badge/Platform-Linux-orange)
+![License](https://img.shields.io/badge/License-Free-brightgreen)
+
 This repository contains three terminal-based CLI utilities:
 
 1. **DirMon** - A directory monitor that logs all file changes in real-time
@@ -31,6 +37,13 @@ sudo pacman -S gcc ncurses
 ```
 
 ## Building and Installation
+
+### Step 0: Download
+
+```bash
+git clone https://github.com/ArmaLv/fin-view.git
+cd fin-view
+```
 
 ### Step 1: Build the utilities
 
