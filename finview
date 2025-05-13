@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import subprocess
+import argparse
+import curses
+import glob
+import time
+import logging
+import datetime
+from pathlib import Path
+
+
+def get_binary_paths():
+
+    script_path = os.path.realpath(sys.argv[0])
+    script_dir = os.path.dirname(script_path)
+    
+
+    possible_locations = [
+
+        script_dir,
+
+        os.path.join(script_dir, "bin"),
+
+    ]
+
+    binary_paths = {}
+    for cmd in ["dirmon", "fileview", "filesearch"]:
+        for location in possible_locations:
+            direct_path = os.path.join(location, cmd)
+            if os.path.exists(direct_path) and os.access(direct_path, os.X_OK):
+                binary_paths[cmd] = direct_path
+                break
+        if cmd not in binary_paths:
+            for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+                possible_path = os.path.join(path_dir, cmd)
+                if os.path.exists(possible_path) and os.access(possible_path, os.X_OK):
+                    binary_paths[cmd] = possible_path
+                    break
+    return binary_paths
+
+def setup_logging():
+    log_dir = os.path.expanduser("~/.finview/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d")
+    log_file = os.path.join(log_dir, f"finview_{timestamp}.log")
+    logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    logging.info("Finview started")
+    log_files = sorted(glob.glob(os.path.join(log_dir, "finview_*.log")))
+    if len(log_files) > 7:
+        for old_log in log_files[:-7]:
+            os.remove(old_log)
+            logging.info(f"Removed old log file: {old_log}")
+
+setup_logging()
+
+BINARY_PATHS = get_binary_paths()
+logging.info(f"Binary paths: {BINARY_PATHS}")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BIN_DIR = os.path.join(BASE_DIR, "bin")
+
+COMMANDS = {
+    "dirmon": {"bin": BINARY_PATHS.get("dirmon", os.path.join(BIN_DIR, "dirmon")), "alias": "dr", "description": "Monitor directory changes in real-time", "help": "[--log-file=FILE] [--curses]"},
+    "fileview": {"bin": BINARY_PATHS.get("fileview", os.path.join(BIN_DIR, "fileview")), "alias": "fv", "description": "View directory structure with highlights", "help": "[--sizes] [--times] [--perms] [--type=EXT] [--minsize=SIZE]"},
+    "filesearch": {"bin": BINARY_PATHS.get("filesearch", os.path.join(BIN_DIR, "filesearch")), "alias": "fs", "description": "Fuzzy search for files and open them", "help": "SEARCH_TERM [--path=PATH] [--rebuild-cache]"}
+}
+
+def get_current_directory():
+    return os.getcwd()
+
+def list_directories(base_dir=None):
+    if base_dir is None:
+        base_dir = get_current_directory()
+    parent_dir = os.path.dirname(os.path.abspath(base_dir))
+    dirs = ["."] + [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and not d.startswith('.')]
+    dirs.sort()
+    return base_dir, dirs
+
+def select_directory_menu(stdscr, base_dir=None):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    current_dir, dirs = list_directories(base_dir)
+    current_row = 0
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+        title = f"Select Directory (Current: {current_dir})"
+        stdscr.addstr(0, 0, title, curses.A_BOLD)
+        stdscr.addstr(1, 0, "=" * min(len(title), width-1))
+        max_dirs = height - 7
+        start_idx = max(0, current_row - max_dirs // 2)
+        end_idx = min(len(dirs), start_idx + max_dirs)
+        for i, directory in enumerate(dirs[start_idx:end_idx], start=start_idx):
+            x = 2
+            y = i - start_idx + 3
+            if i == current_row:
+                stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                stdscr.addstr(y, x, f"> {directory}")
+                stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+            else:
+                if directory == ".":
+                    display_name = ". (Current Directory)"
+                elif directory == "..":
+                    display_name = ".. (Parent Directory)"
+                else:
+                    display_name = directory
+                stdscr.addstr(y, x, f"  {display_name}")
+        stdscr.addstr(height-3, 0, "=" * (width-1))
+        stdscr.addstr(height-2, 0, "↑/↓: Navigate | Enter: Select | q: Quit/Exit")
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_UP and current_row > 0:
+            current_row -= 1
+        elif key == curses.KEY_DOWN and current_row < len(dirs) - 1:
+            current_row += 1
+        elif key == curses.KEY_ENTER or key in [10, 13]:
+            selected = dirs[current_row]
+            if selected == ".":
+                return current_dir
+            elif selected == "..":
+                return os.path.dirname(current_dir)
+            else:
+                new_dir = os.path.join(current_dir, selected)
+                return new_dir
+        elif key == ord('q') or key == ord('Q'):
+            return None
+
+def select_command_menu(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    commands = list(COMMANDS.keys())
+    commands.append("exit")
+    current_row = 0
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, "FinView - Terminal CLI Utilities", curses.A_BOLD)
+        stdscr.addstr(1, 0, "=" * (width-1))
+        for i, cmd in enumerate(commands):
+            x = 2
+            y = i + 3
+            if i == current_row:
+                stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                stdscr.addstr(y, x, f"> {cmd}")
+                stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+            else:
+                stdscr.addstr(y, x, f"  {cmd}")
+            if cmd in COMMANDS:
+                desc = COMMANDS[cmd]["description"]
+                alias = COMMANDS[cmd]["alias"]
+                stdscr.addstr(y, x + 15, f"({alias}) - {desc}")
+        stdscr.addstr(height-3, 0, "=" * (width-1))
+        stdscr.addstr(height-2, 0, "↑/↓: Navigate | Enter: Select | q: Quit/Exit")
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_UP and current_row > 0:
+            current_row -= 1
+        elif key == curses.KEY_DOWN and current_row < len(commands) - 1:
+            current_row += 1
+        elif key == curses.KEY_ENTER or key in [10, 13]:
+            selected = commands[current_row]
+            return selected
+        elif key == ord('q') or key == ord('Q'):
+            return "exit"
+
+def run_command(command, directory, extra_args=None):
+    if command not in COMMANDS:
+        error_msg = f"Unknown command: {command}"
+        logging.error(error_msg)
+        print(error_msg)
+        return
+    cmd_info = COMMANDS[command]
+    binary = cmd_info["bin"]
+    cmd = [binary]
+    if command == "filesearch":
+        if extra_args and len(extra_args) > 0:
+            cmd.append(extra_args[0])
+            if len(extra_args) > 1:
+                cmd.extend(extra_args[1:])
+            cmd.extend(["--path", directory])
+            logging.info(f"Running filesearch with search term '{extra_args[0]}' in directory '{directory}'")
+        else:
+            print("\nEnter a search term: ", end="")
+            search_term = input().strip()
+            if not search_term:
+                logging.info("No search term provided, returning to menu")
+                print("No search term provided. Returning to menu.")
+                return
+            cmd.append(search_term)
+            cmd.extend(["--path", directory])
+            logging.info(f"Running filesearch with search term '{search_term}' in directory '{directory}'")
+    else:
+        cmd.append(directory)
+        logging.info(f"Running {command} in directory '{directory}'")
+        if extra_args:
+            cmd.extend(extra_args)
+            logging.info(f"Additional arguments: {extra_args}")
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        has_termios = True
+    except (ImportError, AttributeError):
+        has_termios = False
+    try:
+        os.system('clear' if os.name == 'posix' else 'cls')
+        print(f"\033[1m{command.upper()} - {cmd_info['description']}\033[0m")
+        print(f"Running in: {directory}")
+        print(f"Press ctrl+c to cancel current execution")
+        print(f" ")
+
+        logging.info(f"Executing command: {' '.join(cmd)}")
+        is_interactive = command in ['dirmon', 'fileview'] or command == 'filesearch'
+        if is_interactive:
+            process = subprocess.run(cmd)
+        else:
+            process = subprocess.run(cmd, capture_output=True, text=True)
+        if hasattr(process, 'stdout') and process.stdout:
+            logging.debug(f"Command stdout: {process.stdout[:500]}" + ("..." if len(process.stdout) > 500 else ""))
+        if hasattr(process, 'stderr') and process.stderr:
+            logging.warning(f"Command stderr: {process.stderr}")
+        if process.returncode != 0:
+            logging.error(f"Command returned non-zero exit code: {process.returncode}")
+        else:
+            logging.info(f"Command completed successfully")
+        print("\n\033[1mCommand completed. Press Enter to return to finview...\033[0m")
+        input()
+    except KeyboardInterrupt:
+        logging.info(f"Command {command} interrupted by user")
+        print("\n\033[1mCommand interrupted. Returning to finview...\033[0m")
+        time.sleep(1)
+    except Exception as e:
+        error_msg = f"Error running command: {e}"
+        logging.error(error_msg)
+        print(f"\n\033[1m{error_msg}\033[0m")
+        print("Press Enter to return to finview...")
+        input()
+    finally:
+        if has_termios:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except:
+                pass
+        os.system('clear' if os.name == 'posix' else 'cls')
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="FinView - Terminal CLI Utilities")
+    parser.add_argument("command", nargs="?", choices=list(COMMANDS.keys()) + ["dr", "fv", "fs"], help="Command to run (dirmon, fileview, filesearch, or their aliases)")
+    parser.add_argument("directory", nargs="?", help="Directory to operate on")
+    parser.add_argument("extra_args", nargs=argparse.REMAINDER, help="Additional arguments to pass to the command")
+    return parser.parse_args()
+
+def create_symlinks():
+    global BIN_DIR
+    if not os.path.exists(BIN_DIR):
+        try:
+            os.makedirs(BIN_DIR)
+        except Exception as e:
+            error_msg = f"Error creating bin directory: {e}"
+            logging.error(error_msg)
+            print(error_msg)
+            return False
+    binaries_exist = True
+    for cmd, info in COMMANDS.items():
+        if not os.path.exists(info["bin"]):
+            binaries_exist = False
+            error_msg = f"Binary not found: {info['bin']}"
+            logging.error(error_msg)
+            print(error_msg)
+    if not binaries_exist:
+        error_msg = "Binaries not found. Please check your installation or run 'make' to build the binaries."
+        logging.error(error_msg)
+        print(error_msg)
+        return False
+    script_path = os.path.realpath(sys.argv[0])
+    script_dir = os.path.dirname(script_path)
+    if script_dir != os.path.abspath(BASE_DIR):
+        if '/bin' in script_dir or script_dir.endswith('/bin'):
+            logging.info(f"Running from installed location {script_dir}, skipping symlink creation")
+            return True
+        logging.info(f"Running from non-standard location: {script_dir}")
+        BIN_DIR = os.path.join(script_dir, "bin")
+        logging.info(f"Updated BIN_DIR to {BIN_DIR}")
+        if not os.path.exists(BIN_DIR):
+            try:
+                os.makedirs(BIN_DIR)
+                logging.info(f"Created bin directory at {BIN_DIR}")
+            except Exception as e:
+                logging.error(f"Could not create bin directory at {BIN_DIR}: {e}")
+                return False
+    for cmd, info in COMMANDS.items():
+        alias_path = os.path.join(BIN_DIR, info["alias"])
+        if os.path.exists(alias_path):
+            try:
+                os.remove(alias_path)
+            except Exception as e:
+                error_msg = f"Warning: Could not remove existing symlink {alias_path}: {e}"
+                logging.warning(error_msg)
+                print(error_msg)
+                continue
+        try:
+            os.symlink(os.path.basename(info["bin"]), alias_path)
+            logging.info(f"Created symlink: {info['alias']} -> {os.path.basename(info['bin'])}")
+        except Exception as e:
+            error_msg = f"Warning: Could not create symlink for {info['alias']}: {e}"
+            logging.warning(error_msg)
+            print(error_msg)
+    return True
+
+def install_finview():
+    script_path = os.path.abspath(__file__)
+    install_dir = os.path.expanduser("~/.local/bin")
+    if not os.path.exists(install_dir):
+        try:
+            os.makedirs(install_dir)
+        except Exception as e:
+            print(f"Error creating directory {install_dir}: {e}")
+            return False
+    try:
+        current_mode = os.stat(script_path).st_mode
+        os.chmod(script_path, current_mode | 0o111)
+    except Exception as e:
+        print(f"Warning: Could not make script executable: {e}")
+    symlink_path = os.path.join(install_dir, "finview")
+    if os.path.exists(symlink_path):
+        try:
+            os.remove(symlink_path)
+        except Exception as e:
+            print(f"Error removing existing symlink: {e}")
+            return False
+    try:
+        os.symlink(script_path, symlink_path)
+        print(f"Installed finview to {symlink_path}")
+        if install_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            print(f"\nNOTE: Add {install_dir} to your PATH to use 'finview' from anywhere.")
+            print("Add this line to your ~/.bashrc or ~/.zshrc:")
+            print(f'export PATH="$PATH:{install_dir}"')
+            print("Then run: source ~/.bashrc (or ~/.zshrc)")
+    except Exception as e:
+        print(f"Error creating symlink: {e}")
+        return False
+    try:
+        for cmd, info in COMMANDS.items():
+            alias = info["alias"]
+            alias_path = os.path.join(install_dir, alias)
+            if os.path.exists(alias_path):
+                os.remove(alias_path)
+            with open(alias_path, 'w') as f:
+                f.write(f"#!/bin/sh\n{symlink_path} {cmd} \"$@\"\n")
+            os.chmod(alias_path, 0o755)
+            print(f"Created alias: {alias} -> {alias_path}")
+    except Exception as e:
+        print(f"Warning: Could not create aliases: {e}")
+    return True
+
+def main():
+    prog_name = os.path.basename(sys.argv[0])
+    if prog_name in ["dr", "fv", "fs"]:
+        alias_to_cmd = {"dr": "dirmon", "fv": "fileview", "fs": "filesearch"}
+        command = alias_to_cmd.get(prog_name)
+        directory = get_current_directory()
+        run_command(command, directory, sys.argv[1:])
+        return
+    args = parse_args()
+    if not create_symlinks():
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "install":
+        install_finview()
+        return
+    if args.command:
+        if args.command in ["dr", "fv", "fs"]:
+            alias_to_cmd = {"dr": "dirmon", "fv": "fileview", "fs": "filesearch"}
+            args.command = alias_to_cmd.get(args.command)
+        
+        directory = args.directory or get_current_directory()
+        
+        run_command(args.command, directory, args.extra_args)
+        return
+
+    try:
+        while True:
+            command = curses.wrapper(select_command_menu)
+            
+            if command == "exit" or command is None:
+                break
+            
+            directory = curses.wrapper(select_directory_menu)
+            
+            if directory is None:
+                continue
+            
+        
+            run_command(command, directory)
+    except KeyboardInterrupt:
+        print("\nExiting...")
+
+if __name__ == "__main__":
+    main()
